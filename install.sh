@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Killora installer - bash <(curl -s https://raw.githubusercontent.com/BrokenCodeZ/Killora/main/install.sh)
+# Killora installer
+# bash <(curl -s https://raw.githubusercontent.com/Joydeep179/Ddos-tool-beta/main/install.sh)
 set -euo pipefail
 
-REPO_RAW="${KILLORA_REPO:-https://raw.githubusercontent.com/BrokenCodeZ/Killora/main}"
+REPO_RAW="${KILLORA_REPO:-https://raw.githubusercontent.com/Joydeep179/Ddos-tool-beta/main}"
 DIR="/opt/killora"
 BIN="/usr/local/bin/killora"
 
@@ -24,6 +25,7 @@ cat <<'EOF'
 EOF
 
 [[ $EUID -eq 0 ]] || die "root chahiye. sudo -i karke chalao."
+command -v curl >/dev/null || die "curl nahi hai. pehle install karo: apt install curl"
 
 say "dependencies install ho rahi hain..."
 if command -v apt-get >/dev/null; then
@@ -54,9 +56,10 @@ pip install -q --upgrade pip
 pip install -q aiohttp aiohttp-socks dnspython httpx h2 uvloop certifi || warn "kuch lib fail hui, core phir bhi chalega"
 
 say "killora.py download ho raha hai..."
-curl -fsSL --retry 3 "$REPO_RAW/killora.py" -o "$DIR/killora.py" || die "download fail. repo URL check karo."
+curl -fsSL --retry 3 "$REPO_RAW/killora.py" -o "$DIR/killora.py" || die "download fail. repo URL / branch check karo."
 [[ -s "$DIR/killora.py" ]] || die "killora.py khali hai"
 
+say "launcher likha ja raha hai..."
 cat > "$BIN" <<EOF
 #!/usr/bin/env bash
 cd "$DIR" || exit 1
@@ -79,7 +82,7 @@ fs.file-max=2097152
 EOF
 sysctl -p /etc/sysctl.d/99-killora.conf >/dev/null 2>&1 || warn "sysctl partial fail"
 
-ok "installed: /opt/killora"
+ok "installed: $DIR"
 ok "chalane ke liye: killora"
 echo
 printf "${C_G}Killora ready.${C_R}\n"
